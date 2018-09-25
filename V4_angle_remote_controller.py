@@ -24,6 +24,8 @@ import numpy as np
 # from scipy.interpolate import spline
 # 9 Axis Abs Orientation Sensor
 from Adafruit_BNO055 import BNO055
+# Multiprocessing
+from multiprocessing import Process, Pipe
 
 # ----------------------------------------------------
 # IMU Code -------------------------------------------
@@ -82,6 +84,12 @@ prev_speedL = 0
 prev_speedR = 0
 prev_speed = 0
 
+m0pos = 0.0
+m0pos_deg = 0.0
+m0theta = 0.0
+m0speed = 0.0
+m0beta = 0.0
+
 m1pos = 0.0
 m1pos_deg = 0.0
 m1theta = 0.0
@@ -92,6 +100,7 @@ m1beta = 0.0
 
 # Find the offset of the encoders (zeros out encoders) properly scaled with
 # pulley ratio
+m0pos_offset = (my_drive.axis0.encoder.pos_estimate)/4.5
 m1pos_offset = (my_drive.axis1.encoder.pos_estimate)/4.5
 
 # Find the offset for the absolute position of the wheel
@@ -115,18 +124,6 @@ P_ON_E = 1  # Default
 # kd = 1
 
 # PID Tuning
-# kp = .1
-# ki = 2
-# kd = 0
-
-# Good-ish
-# kp = 1.5
-# ki = 11
-# kd = 3
-
-# kp = 2
-# ki = 1
-# kd = 0.2*kp
 
 # BEST SO FAR
 # kp = .1
@@ -136,25 +133,10 @@ P_ON_E = 1  # Default
 # # kd=0
 # kd= .1*kp
 
-# # Decent
-# kp = 2.5
-# ki = 5
-# kd = 0.2543
-
-# # Decent
-# kp = .5
-# ki = 2
-# kd= .1*kp
-
-# Needs work
-# kp = .6
-# ki = 5.5
-# kd= .1*kp
-
 kp = .4
 ki = 2.75
-# kd= .1*kp
-kd = 0
+kd= .1*kp
+# kd = 0
 
 sampletime = 1000               # Hertz
 
@@ -393,6 +375,42 @@ def bindto18(deg):
     elif segment > 18:
         return segment - 36
 
+def m0UpdateAbsAngle():
+    global m0pos_offset
+    global my_drive
+    global m0pos
+    global m0pos_deg
+    global m0theta
+    global m0speed
+    global pitch
+    global m0beta
+
+    # Get current position of encoder -> wheel (raw)
+    m0pos = my_drive.axis0.encoder.pos_estimate/4.5
+
+    # Convert to degrees (for DEBUG only)
+    m0pos_deg = todeg(m0pos)
+
+    # Get current position of wheel relative to the zeroed position
+    theta = todeg(m0pos - m0pos_offset) #(wheel angle)
+    # theta = todeg(-m0pos) + m0pos_offset
+
+    # Get speed (for data only)
+    m0speed_raw = my_drive.axis0.encoder.vel_estimate
+
+    # Convert speed to deg/s from counts/s
+    m0speed = m0speed_raw/8192*360 # Deg/s
+    m0wspeed = torad(m0speed/4.5) # Rad/s
+
+    # Get current pitch of body
+    # heading, roll, pitch = bno.read_euler()
+
+    # Find absolute position of the wheel relative to the ground - based on
+    # the marked spoke and the absolute position offset
+    # Then bind the absolute position to 360 degrees then to +/- 180 degrees
+    # beta_diff = pitch - theta
+    m0beta = bindto180(bindto360(pitch + theta + beta0)) ######
+
 def m1UpdateAbsAngle():
     global m1pos_offset
     global my_drive
@@ -431,8 +449,8 @@ def m1UpdateAbsAngle():
 
 # ---------------------------------------------------
 # Controller (Aykut & Wankun) -----------------------
-def phi(k,theta):
-    global theta
+# def phi(k,theta):
+#     global theta
 
 # ---------------------------------------------------
 # Read Joystick Function ----------------------------
@@ -447,17 +465,6 @@ def readJS():
     global jsdev
 
     while True:
-
-        # if setpt_on:
-        #     if (abs(my_drive.axis0.encoder.vel_estimate) > vel_limit) or (abs(my_drive.axis1.encoder.vel_estimate) > vel_limit) :
-        #         # Shutdown motors
-        #         print('Max speed reached, turning off motors...')
-        #         my_drive.axis0.requested_state = AXIS_STATE_IDLE
-        #         my_drive.axis1.requested_state = AXIS_STATE_IDLE
-        #         setpt_on = False
-        #         pid.SetMode(MANUAL)
-        #         angle_cnt = 0
-
         # Read the joystick
         try:
             evbuf = jsdev.read(8)
@@ -563,7 +570,7 @@ def readJS():
                     else:
                         setpt_on = True
                         print('setpt_on is True')
-                        pid.SetMode(AUTOMATIC);
+                        pid.SetMode(AUTOMATIC)
                     # time_.sleep(0.05)   # Debounce
 
             # Decrease angular setpoint if down is pressed
@@ -581,75 +588,109 @@ def readJS():
                         print('Setpoint is %d degrees' % angle_cnt)
                         # time_.sleep(0.05)   # Debounce
 
-# Start the readJS thread. Reads joystick in the "background"
-readJSThrd = threading.Thread(target=readJS)
-readJSThrd.daemon = True
-readJSThrd.start()
-
-# Open txt file to temporarily save test data and then write PID gains
-testdata = open('testdata.csv','w')
-testdata.write('%.2f, %.2f, %.2f\n' % (kp, ki, kd))
-# testdata.write('curr_time, feedback, angle_cnt, mapped_out, pitchrate, m1pos_deg, m1speed, m1beta, vbus, m1curr\n')
-
-# ----------------------------------------------------
-# Loop -----------------------------------------------
-
-while True:
-    # Allows ctrl-C to exit the program, should keep the IMU stable
+def sendReadData(pipe):
     try:
-        # Speed check the motors -- Safety precaution
-        if setpt_on:
-            if (abs(my_drive.axis0.encoder.vel_estimate) > vel_limit) or (abs(my_drive.axis1.encoder.vel_estimate) > vel_limit) :
-                # Shutdown motors
-                print('Max speed reached, turning off motors...')
-                my_drive.axis0.requested_state = AXIS_STATE_IDLE
-                my_drive.axis1.requested_state = AXIS_STATE_IDLE
-                setpt_on = False
-                pid.SetMode(MANUAL)
-                angle_cnt = 0
+        ## Read from the pipe; this will be spawned as a separate Process
+        p_out, p_in = pipe
+        p_in.close()    # Only reading
 
-        # Read the IMU
-        # heading, roll, pitch = bno.read_euler()
+        # prev_time = time_.time()
 
-        # Update IMU at 100 Hz
-        update_orientation(100)
+        # Open txt file to temporarily save test data and then write PID gains
+        testdata = open('testdata.csv','w')
+        testdata.write('%.2f, %.2f, %.2f\n' % (kp, ki, kd))
 
-        # Bound pitch values (for feedback) to 0 - 180 deg
-        if pitch >= 0.0:
-            feedback = pitch
-        else:
-            feedback = 0.0
-
-        # Implement PID
-        if setpt_on:
-            write = pid.Compute(feedback) # Bool
-            output = pid.output
-
-            # Map PID value to desired range of ESC
-            mapped_out = ard_map(output,pid_min,pid_max,esc_min,esc_max)
-
-            # Get data from ODrive
-            m1UpdateAbsAngle()
-            m1curr = my_drive.axis1.motor.current_control.Iq_measured
-            vbus = my_drive.vbus_voltage
-
-            # Only write to the ESC if the PID has been updated
-            if write:
-                my_drive.axis0.controller.current_setpoint = -mapped_out # inverted
-                my_drive.axis1.controller.current_setpoint = mapped_out
-
-                # print('Pitch: %.4f    Feedback: %.4f    Setpoint: %.4f Deg    PID Output: %.4f' % (pitch, feedback, angle_cnt, output))
-                print('Pitch: %.4f    Feedback: %.4f    Setpoint: %.4f Deg    Mapped PID Output: %.4f' % (pitch, feedback, angle_cnt, mapped_out))
-                # print('\rPitch: %.4f \t Speed: %.4f \t Setpoint: %.4f Deg\t Mapped PID Output: %.4f' % (pitch, abs(my_drive.axis0.encoder.vel_estimate), angle_cnt, mapped_out), end='')
-                # print('Pitch: %.4f \t Speed: %.4f \t Setpoint: %.4f Deg\t Mapped PID Output: %.4f' % (pitch, abs(my_drive.axis0.encoder.vel_estimate), angle_cnt, mapped_out))
-
-                # testdata.write('%.6f, %.4f, %.4f, %.4f\n' % (curr_time, feedback, angle_cnt, mapped_out))
-                testdata.write('%.6f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f\n' % (curr_time, feedback, angle_cnt, mapped_out, pitchrate, m1pos_deg, m1speed, m1beta, vbus, m1curr))
-
-    except (KeyboardInterrupt):
-        # Turn off the motors
-        my_drive.axis0.requested_state = AXIS_STATE_IDLE
-        my_drive.axis1.requested_state = AXIS_STATE_IDLE
-        # Close the data file
+        while True:
+            if p_out.poll():
+                data_out = p_out.recv()
+                testdata.write('%.6f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f\n' % (data_out['curr_time'], data_out['feedback'], data_out['angle_cnt'], data_out['mapped_out'], data_out['pitchrate'], data_out['m1pos_deg'], data_out['m1speed'], data_out['m1beta'], data_out['vbus'], data_out['m1curr']))
+                # print('Pitch: %.4f    Feedback: %.4f    Setpoint: %.4f Deg    Mapped PID Output: %.4f' % (data_out['pitch'], data_out['feedback'], data_out['angle_cnt'], data_out['mapped_out']))
+    finally:
         testdata.close()
-        sys.exit()
+
+if __name__ == '__main__':
+
+    # Start the readJS thread. Reads joystick in the "background"
+    readJSThrd = threading.Thread(target=readJS)
+    readJSThrd.daemon = True
+    readJSThrd.start()
+
+    # Start the sendReadData process. Writes and sends data outside the main loop
+    p_out, p_in = Pipe()
+    sendReadDataThrd = Process(target=sendReadData, args=((p_out,p_in,),))
+    sendReadDataThrd.daemon = True
+    sendReadDataThrd.start()
+
+    p_out.close() # Don't need this anymore
+
+    # Open txt file to temporarily save test data and then write PID gains
+    # testdata = open('testdata.csv','w')
+    # testdata.write('%.2f, %.2f, %.2f\n' % (kp, ki, kd))
+    # testdata.write('curr_time, feedback, angle_cnt, mapped_out, pitchrate, m1pos_deg, m1speed, m1beta, vbus, m1curr\n')
+
+    pt = time_.time()
+
+    # ----------------------------------------------------
+    # Loop -----------------------------------------------
+    while True:
+        # Allows ctrl-C to exit the program, should keep the IMU stable
+        try:
+            # Speed check the motors -- Safety precaution
+            ct = time_.time()
+            if setpt_on:
+                if (abs(my_drive.axis0.encoder.vel_estimate) > vel_limit) or (abs(my_drive.axis1.encoder.vel_estimate) > vel_limit) :
+                    # Shutdown motors
+                    print('Max speed reached, turning off motors...')
+                    my_drive.axis0.requested_state = AXIS_STATE_IDLE
+                    my_drive.axis1.requested_state = AXIS_STATE_IDLE
+                    setpt_on = False
+                    pid.SetMode(MANUAL)
+                    angle_cnt = 0
+
+            # Update IMU at 100 Hz
+            update_orientation(100)
+
+            # Bound pitch values (for feedback) to 0 - 180 deg
+            if pitch >= 0.0:
+                feedback = pitch
+            else:
+                feedback = 0.0
+
+            # Implement PID
+            if setpt_on:
+                write = pid.Compute(feedback) # Bool
+                output = pid.output
+
+                # Map PID value to desired range of ESC
+                mapped_out = ard_map(output,pid_min,pid_max,esc_min,esc_max)
+
+                # Get data from ODrive
+                m1UpdateAbsAngle()
+                m1curr = my_drive.axis1.motor.current_control.Iq_measured
+                vbus = my_drive.vbus_voltage
+
+                # Only write to the ESC if the PID has been updated
+                if write:
+                    my_drive.axis0.controller.current_setpoint = -mapped_out # inverted
+                    my_drive.axis1.controller.current_setpoint = mapped_out
+
+                    # print('Pitch: %.4f    Feedback: %.4f    Setpoint: %.4f Deg    Mapped PID Output: %.4f' % (pitch, feedback, angle_cnt, mapped_out))
+                    # testdata.write('%.6f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f\n' % (curr_time, feedback, angle_cnt, mapped_out, pitchrate, m1pos_deg, m1speed, m1beta, vbus, m1curr))
+                
+                # if curr_time-prev_time >= .05:
+                dtime = ct-pt
+                # data_out = {'curr_time':curr_time, 'pitch':pitch, 'feedback':feedback, 'angle_cnt':angle_cnt, 'mapped_out':mapped_out, 'pitchrate':pitchrate, 'm1pos_deg':m1pos_deg, 'm1speed':m1speed, 'm1beta':m1beta, 'vbus':vbus, 'm1curr':m1curr}
+                # print(data_out)
+                # p_in.send(data_out)
+                # print('written')
+                p_in.send({'curr_time':curr_time, 'pitch':pitch, 'feedback':feedback, 'angle_cnt':angle_cnt, 'mapped_out':mapped_out, 'pitchrate':pitchrate, 'm1pos_deg':m1pos_deg, 'm1speed':m1speed, 'm1beta':m1beta, 'vbus':vbus, 'm1curr':m1curr})
+                print(dtime)
+                pt = ct
+
+        except (KeyboardInterrupt):
+            # Turn off the motors
+            my_drive.axis0.requested_state = AXIS_STATE_IDLE
+            my_drive.axis1.requested_state = AXIS_STATE_IDLE
+            # Close the data file
+            # testdata.close()
+            sys.exit()
